@@ -174,7 +174,7 @@ def generate_coarse_reference(x, noise_std=0.0, downsample=7):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["train", "sample", "frs"], default="train")
-    parser.add_argument("--checkpoint", type=str, default="flow_mnist.pt")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/flow_mnist.pt")
     args = parser.parse_args()
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -210,7 +210,7 @@ if __name__ == "__main__":
             avg = total_loss / len(loader)
             print(f"epoch {epoch+1}/{epochs}  loss {avg:.4f}")
         
-        torch.save(model.state_dict(), "flow_mnist.pt")
+        torch.save(model.state_dict(), "checkpoints/flow_mnist.pt")
 
         imgs = sample(model, (16, 1, 28, 28), device=device) 
         print("generated:", imgs.shape)
@@ -221,7 +221,7 @@ if __name__ == "__main__":
         model.eval()
         imgs = sample(model, (16, 1, 28, 28), device=device)
         imgs = (imgs + 1) / 2
-        save_image(imgs, "samples.png", nrow=4)
+        save_image(imgs, "outputs/samples.png", nrow=4)
         print("saved samples.png")
     
     elif args.mode == "frs":
@@ -261,7 +261,7 @@ if __name__ == "__main__":
         # row 4: normal random samples
         grid = torch.cat([x_real, x_ref, x_frs, x_rand], dim=0)
         grid = (grid + 1) / 2
-        save_image(grid, "frsc_.png", nrow=16)
+        save_image(grid, "outputs/frsc_.png", nrow=16)
 
-        print("saved frs_comparison.png")
+        print("saved frsc_.png")
         print("rows: real | crude reference | FRS refined | random samples")
