@@ -4,12 +4,14 @@
 # Linearly interpolate between x0 and x1
 # Get U-Net predict the velocity vector field
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+from torchvision.utils import save_image
 
 
 # Timestep Embedding
@@ -112,40 +114,148 @@ def sample(model, shape, steps=50, device="mps"):
     
     return x.clamp(-1, 1)
 
+# Reverse Flow
+@torch.no_grad()
+def reverse_flow(model, xr, kr=10):
+    device=xr.device
+    b = xr.shape[0]
+    x = xr.clone()
+    dt = 1.0 / kr
+
+    for i in reversed(range(kr)):
+        tv = (i+1)*dt
+        # timestep for batch
+        t = torch.full((b,), tv, device=device)
+        pred_v = model(x,t)
+        # travel in opposite direction of predicted velocity from flow policy
+        x = x - dt * pred_v
+    
+    return x
+
+@torch.no_grad()
+def forward_flow(model, x0, kf=50):
+    device = x0.device
+    B = x0.shape[0]
+    x = x0.clone()
+    dt = 1.0 / kf
+
+    for i in range(kf):
+        tval = i * dt
+        t = torch.full((B,), tval, device=device)
+        v = model(x, t)
+        x = x + dt * v
+
+    return x.clamp(-1, 1)
+
+@torch.no_grad()
+def frs(model, xr, rs=10, fs=50):
+    # coarse reference -> predicted noise -> refined in-distribution point
+    x0r = reverse_flow(model, xr, kr=rs)
+    xfrs = forward_flow(model, x0r, kf=fs)
+    return xfrs
+
+
+@torch.no_grad()
+def generate_coarse_reference(x, noise_std=0.0, downsample=7):
+    crude = F.interpolate(x, size=(downsample, downsample), mode="area")
+    crude = F.interpolate(crude, size=(28, 28), mode="nearest")
+
+    # Add noise
+    crude = crude + noise_std * torch.randn_like(crude)
+
+    return crude.clamp(-1, 1)
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["train", "sample", "frs"], default="train")
+    parser.add_argument("--checkpoint", type=str, default="flow_mnist.pt")
+    args = parser.parse_args()
+
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"using device: {device}")
 
-    model  = UNet(inc=1, bc=64).to(device)
-    optimizer = Adam(model.parameters(), lr=1e-4)
+    if args.mode == "train":
+        model  = UNet(inc=1, bc=64).to(device)
+        optimizer = Adam(model.parameters(), lr=1e-4)
 
-    # Data
-    tf = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))  # maps to [-1, 1]
-    ])
-    dataset = datasets.MNIST(root="./data", train=True, download=True, transform=tf)
-    loader  = DataLoader(dataset, batch_size=128, shuffle=True, drop_last=True)
+        # Data
+        tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))  # maps to [-1, 1]
+        ])
+        dataset = datasets.MNIST(root="./data", train=True, download=True, transform=tf)
+        loader  = DataLoader(dataset, batch_size=128, shuffle=True, drop_last=True)
 
-    model = UNet(inc=1, bc=64).to(device)
-    optimizer = Adam(model.parameters(), lr=1e-4)
+        model = UNet(inc=1, bc=64).to(device)
+        optimizer = Adam(model.parameters(), lr=1e-4)
 
-    print("data loaded")
-    epochs = 20
-    for epoch in range(epochs):
-        total_loss = 0
-        for x1, _ in loader:
-            x1 = x1.to(device)
-            optimizer.zero_grad()
-            loss = fml(model, x1)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+        print("data loaded")
+        epochs = 25
+        for epoch in range(epochs):
+            total_loss = 0
+            for x1, _ in loader:
+                x1 = x1.to(device)
+                optimizer.zero_grad()
+                loss = fml(model, x1)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            
+            avg = total_loss / len(loader)
+            print(f"epoch {epoch+1}/{epochs}  loss {avg:.4f}")
         
-        avg = total_loss / len(loader)
-        print(f"epoch {epoch+1}/{epochs}  loss {avg:.4f}")
-    
-    torch.save(model.state_dict(), "flow_mnist.pt")
+        torch.save(model.state_dict(), "flow_mnist.pt")
 
-    imgs = sample(model, (16, 1, 28, 28), device=device) 
-    print("generated:", imgs.shape)
+        imgs = sample(model, (16, 1, 28, 28), device=device) 
+        print("generated:", imgs.shape)
+
+    elif args.mode == "sample":
+        model = UNet(inc=1, bc=64).to(device)
+        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        model.eval()
+        imgs = sample(model, (16, 1, 28, 28), device=device)
+        imgs = (imgs + 1) / 2
+        save_image(imgs, "samples.png", nrow=4)
+        print("saved samples.png")
+    
+    elif args.mode == "frs":
+        model = UNet(inc=1, bc=64).to(device)
+        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        model.eval()
+
+        tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+
+        dataset = datasets.MNIST(root="./data", train=False, download=True, transform=tf)
+        loader = DataLoader(dataset, batch_size=16, shuffle=True, drop_last=True)
+
+        x_real, labels = next(iter(loader))
+        x_real = x_real.to(device)
+
+        # Crude "VLM-like" reference
+        x_ref = generate_coarse_reference(x_real, noise_std=0.5, downsample=7)
+
+        # FRS refinement
+        x_frs = frs(
+            model,
+            x_ref,
+            rs=10,
+            fs=50,
+        )
+
+        # Also compare normal random samples
+        x_rand = sample(model, (16, 1, 28, 28), steps=50, device=device)
+
+        # Save comparison grid:
+        # row 1: real
+        # row 2: crude references
+        # row 3: FRS outputs
+        # row 4: normal random samples
+        grid = torch.cat([x_real, x_ref, x_frs, x_rand], dim=0)
+        grid = (grid + 1) / 2
+        save_image(grid, "frsc_.png", nrow=16)
+
+        print("saved frs_comparison.png")
+        print("rows: real | crude reference | FRS refined | random samples")
