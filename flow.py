@@ -157,13 +157,19 @@ def frs(model, xr, rs=10, fs=50):
 
 @torch.no_grad()
 def generate_coarse_reference(x, noise_std=0.0, downsample=7):
-    crude = F.interpolate(x, size=(downsample, downsample), mode="area")
-    crude = F.interpolate(crude, size=(28, 28), mode="nearest")
+    coarse = F.interpolate(x, size=(downsample, downsample), mode="area")
+    coarse = F.interpolate(coarse, size=(28, 28), mode="nearest")
 
     # Add noise
-    crude = crude + noise_std * torch.randn_like(crude)
+    # crude = crude + noise_std * torch.randn_like(crude)
+    # lowfreq_noise_std = 0.15
+    # if lowfreq_noise_std > 0:
+    #     n = torch.randn(x.shape[0], x.shape[1], 7, 7, device=x.device)
+    #     n = F.interpolate(n, size=(28, 28), mode="bilinear", align_corners=False)
+    #     coarse = coarse + lowfreq_noise_std * n
 
-    return crude.clamp(-1, 1)
+
+    return coarse.clamp(-1, 1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -241,7 +247,7 @@ if __name__ == "__main__":
         x_frs = frs(
             model,
             x_ref,
-            rs=10,
+            rs=5,
             fs=50,
         )
 
